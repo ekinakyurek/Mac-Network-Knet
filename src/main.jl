@@ -1,11 +1,15 @@
 using ImageMagick, Images
-using AutoGrad, Knet, KnetLayers, JSON, HDF5#xs, Plots
-using Printf,Random
-using JLD2,FileIO
-import KnetLayers: IndexedDict
+using AutoGrad, Knet, KnetLayers, JSON, HDF5
+using Printf, Random
+import KnetLayers: IndexedDict, arrtype, Activation, Filtering, Layer,
+                  _batchSizes2indices, PadRNNOutput, one_hot, _pack_sequence
+include(KnetLayers.dir("examples/resnet.jl")) #load resnet functionalities
+using .ResNetLib
 
-include("model.jl"); println("Including model.jl")
-savemodel(filename,m,mrun,o) = Knet.save(filename,"m",m,"mrun",mrun,"o",o)
+include("model.jl")
+
+savemodel(filename,m,mrun,o) =
+    Knet.save(filename,"m",m,"mrun",mrun,"o",o)
 
 function loadmodel(filename;onlywrun=false)
     d = Knet.load(filename)
@@ -22,7 +26,6 @@ function getQdata(dhome,set; fname="objects")
     JSON.parsefile(dhome*"gen_gqa_"*fname*"_"*set*"Instances.json")
 end
 
-
 function getDicts(dhome,dicfile;fname="objects")
     dic  = JSON.parsefile(dhome*"vocab.json")
     words  = IndexedDict(convert(Dict{String,Int},dic["word_dic"]))
@@ -33,75 +36,34 @@ end
 
 function loadFeatures(dhome;h5=false, featsize=(2048,100), fname="objects")
     if h5
-        return h5open(dhome*"gqa_"*fname*".h5","r")["data"]
+        h5open(dhome*"gqa_"*fname*".h5","r")["features"]
     else
         feats = reinterpret(Float32,read(open(dhome*"all_"*fname*".bin")))
-        return reshape(feats,(featsize...,div(length(feats),prod(featsize))))
+        reshape(feats,(featsize...,div(length(feats),prod(featsize))))
     end
 end
 
-function miniBatch(data,q2i,a2i,id2index;shfl=true,srtd=false,B=32)
+unzip(d; range=fieldnames(eltype(d))) = map(x->getfield.(d, x),range)
+function miniBatch(data, q2i, a2i, id2index; shfl=true, srtd=false, B=64)
     L = length(data)
     shfl && shuffle!(data)
     srtd && sort!(data;by=x->length(x["question"]))
     batchs = [];
     for i=1:B:L
-        b         = min(L-i+1,B)
-        questions = Array{Int}[]
-        answers   = zeros(Int,b)
-        images    = Int[]
-        families  =zeros(Int,b)
-        objectsNums =zeros(Int,b)
-        for j=1:b
-            crw = data[i+j-1]
-            push!(questions,map(x->get(q2i,x,"<UNK>"),Iterators.reverse(crw["question"])))
-            push!(images,Int(id2index[crw["imageId"]["id"]]["index"]))
-            answers[j]  = get(a2i,crw["answer"],"<UNK>")
-            families[j] = 1 #parse(Int,Base.hash(crw["type"]))
-            objectsNums[j] = Int(crw["objectsNum"])
+        batch = map(1:min(L-i+1,B)) do j
+             d = data[i+j-1]
+            (map(x->get(q2i,x,"<UNK>"),d["question"]), 
+             Int(id2index[d["imageId"]["id"]]["index"]),
+             get(a2i,d["answer"],"<UNK>"),
+             1, # FIXME: questionFamily
+             Int(get(d,"objectsNum",100)))
         end
-
-        lngths     = length.(questions);
-        srtindices = sortperm(lngths;rev=true)
-
-        lngths     = lngths[srtindices]
-        Tmax       = lngths[1]
-        questions  = questions[srtindices]
-        answers    = answers[srtindices]
-        images     = images[srtindices]
-        families   = families[srtindices]
-        objectsNums = objectsNums[srtindices]
-        
-        qs = Int[];
-        batchSizes = Int[];
-        pads = falses(b,Tmax)
-        object_pads = falses(b,100)
-
-        for k=1:b
-            pads[k,lngths[k]+1:Tmax] .= true
-            object_pads[k,objectsNums[k]+1:100] .= true
-        end
-
-        if sum(pads)==0
-           pads=nothing
-        end
-       
-
-        while true
-            batch = 0
-            for j=1:b
-                if length(questions[j]) > 0
-                    batch += 1
-                    push!(qs,pop!(questions[j]))
-                end
-            end
-            if batch != 0
-                push!(batchSizes,batch)
-            else
-                break;
-            end
-        end
-        push!(batchs,(images,qs,answers,batchSizes,pads,families, object_pads))
+        batch = sort!(batch, by=d->length(d[1]), rev=true)
+        quesvecs, images, answers, families, objectnums = unzip(batch; range=1:5)
+        questions, batchSizes = _pack_sequence(quesvecs)
+        q_mask  = maskQuestions(length.(quesvecs))
+        kb_mask = maskObjects(objectnums)
+        push!(batchs,(images, questions, batchSizes, answers, families, objectnums, q_mask, kb_mask))
     end
     return batchs
 end
@@ -120,63 +82,70 @@ function loadTrainingData(dhome="data/";h5=false)
     return feats,(trnqstns,valqstns),(qvoc,avoc,id2index),embeddings
 end
 
-function loadDemoData(dhome="data/demo/")
+function loadDemoData(dhome="data/demo/",featsize=(2048,100))
     println("Loading demo features ...")
-    feats = loadFeatures(dhome,"demo")
+    feats = reinterpret(Float32,read(open(dhome*"demo.bin")))
+    feats = reshape(feats,(featsize...,div(length(feats),prod(featsize))))
     println("Loading demo questions ...")
-    qstns = getQdata(dhome,"demo")
+    qstns = JSON.parsefile(dhome*"demo.json")
     println("Loading dictionaries ...")
-    dics = getDicts(dhome,"dic")
+    d = KnetLayers.load(dhome*"dict.jld2")
+    dics = (d["word_dict"],d["answer_dict"])
     return feats,qstns,dics
 end
 
-function modelrun(M,data,feats,o,Mrun=nothing;train=false)
-    getter(id) = view(feats,:,:,:,id)
-    cnt=total=0.0; L=length(data);
-    Mparams   = params(M)
-    Rparams   = Mrun !== nothing ? params(Mrun) : nothing
-    # results   = similar(Array{Float32},200704*48) #uncomment for INPLACE
-    println("Timer Starts");
-    for i in progress(randperm(L))
-        ids,questions,answers,batchSizes,pad,families,o_pad = data[i]
-        B    = batchSizes[1]
-        xB   = arrtype(ones(Float32,1,B))
-        #x    = inplace_batcher(results,feats,ids) #uncomment for INPLACE
-        x    = batcher1(feats,ids) #comment for INPLACE
-        xS   = arrtype(x)
-        #xS   = arrtype(reshape(cat1d(map(getter,ids)...),14,14,1024,B))
-        xP       = pad==nothing ? nothing : arrtype(pad*Float32(1e22))
-        object_P = arrtype(o_pad*Float32(1e22))
+exp_mask(mask, atype) = atype(mask*(-1.0f22))
+exp_mask(mask::Nothing, atype) = nothing
+
+function modelrun(M,data,feats,o,Mrun=nothing; train::Bool=false, interval::Int=1000)
+    ft = eltype(arrtype)
+    cnt, total, L = ft(0), ft(0), length(data)
+    Mp, MRp  = params(M), params(Mrun)
+    println(@sprintf("%.2f Accuracy|Loss", train ? cnt/total : 100cnt/total))
+    for (t,i) in progress(enumerate(randperm(L)))
+        images, questions, batchSizes, answers,_,_,q_mask,kb_mask = data[i]
+        total += B = length(images)
+        ximg  = arrtype(loadImageBatch(feats,images,o[:featType]))
+        qmask, kbmask = exp_mask(q_mask, arrtype), exp_mask(kb_mask, arrtype)
         if train
-            J = @diff M(questions,batchSizes,xS,xB,xP,object_P;answers=answers,p=o[:p],selfattn=o[:selfattn],gating=o[:gating])
-            cnt += value(J)*B; total += B;
-            update_with_gclip(J,Mparams;clip=8.0f0)
-            if Mrun != nothing
-                for (wr,wi) in zip(Rparams,Mparams);
-                    Knet.axpy!(1.0f0-o[:ema],wi.value-wr.value,wr.value);
-                end
-            end
+            J = @diff M(questions,batchSizes,ximg,qmask,kbmask; answers=answers, p=o[:p])
+            update_with_gclip(J, Mp; clip=ft(8))
+            cnt += value(J)*B
+            Mrun===nothing || ema_apply!(Mp, MRp, ft(o[:ema]))
         else
-            preds  = M(questions,batchSizes,xS,xB,xP,object_P;p=o[:p],selfattn=o[:selfattn],gating=o[:gating])
-            cnt   += sum(preds.==answers)
-            total += B
+            preds = M(questions,batchSizes,ximg,qmask,kbmask; p=o[:p])
+            cnt += sum(preds .== answers)
         end
-        i % 1000 == 0 && println(@sprintf("%.2f Accuracy|Loss", train ? cnt/total : 100cnt/total))
+        t%interval==0 && println(@sprintf("%.2f Accuracy|Loss", train ? cnt/total : 100cnt/total))
     end
+    println(@sprintf("%.2f Accuracy|Loss", train ? cnt/total : 100cnt/total))
     train && savemodel(o[:prefix]*".jld2",M,Mrun,o);
     return cnt/total
 end
 
+function ema_apply!(Mparams, Rparams, ema::Real)
+    for (wr,wi) in zip(Rparams,Mparams);
+        Knet.axpy!(1-ema,wi.value-wr.value,wr.value);
+    end
+end
+
+function Base.copyto!(Mdest,Msource)
+    for (wr,wi) in zip(params(Mdest),params(Msource));
+        value(wr)[:] = value(wi)[:] 
+    end
+    return Mdest
+end
+
+
 function train!(M,Mrun,sets,feats,o)
     @info "Training Starts...."
     setoptim!(M,o)
-    minloss = typemax(Float64)
+    minloss = typemax(Float32)
     for i=1:o[:epochs]
         println("Epoch $(i) starts...")
         trnloss = modelrun(M,sets[1],feats,o,Mrun;train=true)
         if trnloss > minloss
-            println("learning decay")
-            lrdecay!(M,0.5)
+            lrdecay!(M,0.5f0)
         else
             minloss = trnloss
         end
@@ -234,12 +203,12 @@ function validate(mfile,dhome,o)
      return Mrun,valset,feats
 end
 
-function singlerun(Mrun,feat,question;p=12,selfattn=false,gating=false)
-    results        = Dict{String,Any}("cnt"=>1)
-    batchSizes     = ones(Int,length(question))
-    xB             = arrtype(ones(Float32,1,1))
-    outputs = Mrun(question,batchSizes,feat,xB,nothing;tap=results,p=p,selfattn=selfattn,gating=gating,allsteps=true)
-    prediction = argmax(results["y"])
+function singlerun(Mrun,ximg,question;p=4,objectnum=100)
+    results    = Dict{String,Any}("cnt"=>1)
+    batchSizes = ones(Int,length(question))
+    kb_mask    = exp_mask(maskObjects([objectnum]),arrtype)
+    outputs = Mrun(question,batchSizes,ximg,nothing,kb_mask;tap=results,p=p,allsteps=true)
+    prediction = make_predictions(results["y"])
     return results,prediction,outputs
 end
 
@@ -270,8 +239,8 @@ function scalepixel(pixel,scaler)
      return HSV(pixel.h,pixel.s,min(1.0,pixel.v+5*scaler))
 end
 
-function update_with_gclip(J,ws; clip=8.0f0)
-    gnorm=0.0f0
+function update_with_gclip(J, ws; clip=8.0f0)
+    gnorm=zero(clip)
     for w in ws
         gnorm += Knet.norm(grad(J,w))^2
     end

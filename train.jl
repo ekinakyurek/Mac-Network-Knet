@@ -1,6 +1,5 @@
 import Pkg; Pkg.activate("."); Pkg.instantiate();
-println(args)
-for arg in args; include(arg); end
+for arg in ARGS; include(arg); end
 println("Loading questions ...")
 Knet.seed!(11131994)
 trnqstns = getQdata(o[:dhome],"train")
@@ -13,8 +12,8 @@ qvoc,avoc,embeddings = dwe["word_dict"],dwe["answer_dict"],dwe["embeddings"];
 dicts = (qvoc,avoc,id2index)
 sets = []
 push!(sets,miniBatch(trnqstns,dicts...;B=o[:batchsize]))
-push!(sets,miniBatch(valqstns,dicts...;B=10))
-push!(sets,miniBatch(testdevqstns,dicts...;B=10))
+push!(sets,miniBatch(valqstns,dicts...;B=o[:batchsize]))
+push!(sets,miniBatch(testdevqstns,dicts...;B=o[:batchsize]))
 trnqstns=nothing;
 valqstns=nothing;
 #MODEL
@@ -24,13 +23,10 @@ KnetLayers.settype!(KnetArray{Float32})
 #if o[:mfile] !=nothing && isfile(o[:mfile])
 #    M,Mrun,o = loadmodel(o[:mfile])
 #else
-    M    = MACNetwork(o;embed=Param(arrtype(copy(embeddings))));
-    Mrun = MACNetwork(o);
+    M    = MACNetwork(o;embeddings=embeddings);
+    Mrun = copyto!(MACNetwork(o),M)
 #end
 
-for (wr,wi) in zip(params(Mrun),params(M))
-    wr.value[:] = wi.value[:]
-end
 Knet.gc()
 #FEATS
 feats = loadFeatures(o[:dhome];h5=o[:h5])
